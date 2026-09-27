@@ -571,6 +571,7 @@ internal let SensorsList: [Sensor] = [
     Sensor(key: "PC3C", name: "RAM", group: .sensor, type: .power, platforms: Platform.all),
     Sensor(key: "PPBR", name: "Battery", group: .sensor, type: .power, platforms: Platform.all),
     Sensor(key: "PDTR", name: "DC In", group: .sensor, type: .power, platforms: Platform.all),
+    Sensor(key: "PD0R", name: "DC In rail", group: .sensor, type: .power, platforms: Platform.all),
     Sensor(key: "PMTR", name: "Memory Total", group: .sensor, type: .power, platforms: Platform.all),
     Sensor(key: "PSTR", name: "System Total", group: .sensor, type: .power, platforms: Platform.all),
     

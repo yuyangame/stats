@@ -30,6 +30,11 @@ internal class SensorsReader: Reader<Sensors_List> {
     private var subscription: IOReportSubscriptionRef? = nil
     private var powers: (CPU: Double, GPU: Double, ANE: Double, RAM: Double, PCI: Double) = (0.0, 0.0, 0.0, 0.0, 0.0)
     
+    private var pmpChannels: CFMutableDictionary? = nil
+    private var pmpSubscription: IOReportSubscriptionRef? = nil
+    private var pmpPrevSample: CFDictionary? = nil
+    private var energyModelCPUGated: Bool = false
+    
     init(callback: @escaping (T?) -> Void = {_ in }) {
         self.unknownSensorsState = Store.shared.bool(key: "Sensors_unknown", defaultValue: false)
         super.init(.sensors, callback: callback)
@@ -38,6 +43,13 @@ internal class SensorsReader: Reader<Sensors_List> {
         var dict: Unmanaged<CFMutableDictionary>?
         self.subscription = IOReportCreateSubscription(nil, self.channels, &dict, 0, nil)
         dict?.release()
+        
+        self.pmpChannels = self.getPMPEnergyChannels()
+        if self.pmpChannels != nil {
+            var pmpDict: Unmanaged<CFMutableDictionary>?
+            self.pmpSubscription = IOReportCreateSubscription(nil, self.pmpChannels, &pmpDict, 0, nil)
+            pmpDict?.release()
+        }
         
         self.list.sensors = self.sensors()
     }
@@ -226,6 +238,14 @@ internal class SensorsReader: Reader<Sensors_List> {
                     }
                 }
             }
+        }
+        
+        // PSTR reads 0 on Mac Studio (M5 Ultra, macOS 27). PD0R, the DC-in rail,
+        // is the internal PSU's output there, so it is the whole board.
+        if let idx = sensors.firstIndex(where: { $0.key == "PSTR" }), sensors[idx].value == 0 {
+            sensors[idx].value = ["PDTR", "PD0R"].lazy.compactMap({ key in
+                sensors.first(where: { $0.key == key })?.value
+            }).first(where: { $0 > 0 }) ?? 0
         }
         
         if let PSTRSensor = sensors.first(where: { $0.key == "PSTR"}), PSTRSensor.value > 0 {
@@ -565,6 +585,9 @@ extension SensorsReader {
         let prevRAM = self.powers.RAM
         let prevPCI = self.powers.PCI
         
+        // Multi-die chips report one channel per die ("DIE_0_CPU Energy",
+        // "DIE_1_CPU Energy", "ANE0_0", "ANE0_1", ...), so sum every match.
+        var energy: (CPU: Double, GPU: Double, ANE: Double, RAM: Double, PCI: Double) = (0, 0, 0, 0, 0)
         for i in 0..<CFArrayGetCount(items) {
             let dict = CFArrayGetValueAtIndex(items, i)
             let item = unsafeBitCast(dict, to: CFDictionary.self)
@@ -577,35 +600,112 @@ extension SensorsReader {
             let value = Double(IOReportSimpleGetIntegerValue(item, 0))
             
             if channel.hasSuffix("CPU Energy") {
-                self.powers.CPU = value.power(unit)
+                energy.CPU += value.power(unit)
             } else if channel.hasSuffix("GPU Energy") {
-                self.powers.GPU = value.power(unit)
+                energy.GPU += value.power(unit)
             } else if channel.starts(with: "ANE") {
-                self.powers.ANE = value.power(unit)
+                energy.ANE += value.power(unit)
             } else if channel.starts(with: "DRAM") {
-                self.powers.RAM = value.power(unit)
+                energy.RAM += value.power(unit)
             } else if channel.starts(with: "PCI") && channel.hasSuffix("Energy") {
-                self.powers.PCI = value.power(unit)
+                energy.PCI += value.power(unit)
             }
         }
+        self.powers = energy
+        let pmpCPU = self.pmpCPUPower()
         
+        // The first read has no previous sample. Do not also gate on the CPU
+        // counter: on macOS 27 it stays 0, which zeroed every power here.
         guard let lastIOSensorsRead = self.lastIOSensorsRead else {
             self.lastIOSensorsRead = now
             return (0, 0, 0, 0, 0)
         }
-        guard prevCPU != 0 else {
-            self.lastIOSensorsRead = now
-            return (0, 0, 0, 0, 0)
-        } // omit first read
         
         let elapsed = now.timeIntervalSince(lastIOSensorsRead)
         defer { self.lastIOSensorsRead = now }
+        var cpu = Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed)
+        // macOS 27 gates the Energy Model CPU counter: it reads 0 and only
+        // advances, over partial windows, while an entitled sampler such as
+        // powermetrics or Activity Monitor runs. The first 0 while the PMP
+        // histograms show CPU power switches to PMP for good, so the value
+        // does not flap between the two sources.
+        if let pmpCPU, cpu <= 0, pmpCPU > 0 {
+            self.energyModelCPUGated = true
+        }
+        if self.energyModelCPUGated, let pmpCPU {
+            cpu = pmpCPU
+        }
         return (
-            Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed),
+            cpu,
             Self.appleSiliconPower(currentEnergy: self.powers.GPU, previousEnergy: prevGPU, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.ANE, previousEnergy: prevANE, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.PCI, previousEnergy: prevPCI, elapsed: elapsed)
         )
+    }
+    
+    // CPU cluster power histograms in the PMP "Energy" subgroup ("PACC0",
+    // "MACC1", "PACC0 SRAM", ...). They keep counting on macOS 27, where the
+    // Energy Model CPU counters stay 0. Multi-die chips split the group per
+    // die ("PMP0", "PMP1") and leave "PMP" empty, so merge them all.
+    private func getPMPEnergyChannels() -> CFMutableDictionary? {
+        var merged: CFMutableDictionary? = nil
+        for group in ["PMP"] + (0..<8).map({ "PMP\($0)" }) {
+            guard let channel = IOReportCopyChannelsInGroup(group as CFString, "Energy" as CFString, 0, 0, 0)?.takeRetainedValue(),
+                  let dict = channel as? [String: Any],
+                  let list = dict["IOReportChannels"] as? [Any], !list.isEmpty else { continue }
+            if let merged {
+                IOReportMergeChannels(merged, channel, nil)
+            } else {
+                merged = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, channel)
+            }
+        }
+        return merged
+    }
+    
+    private func pmpCPUPower() -> Double? {
+        guard let subscription = self.pmpSubscription,
+              let sample = IOReportCreateSamples(subscription, self.pmpChannels, nil)?.takeRetainedValue() else { return nil }
+        defer { self.pmpPrevSample = sample }
+        guard let prev = self.pmpPrevSample,
+              let delta = IOReportCreateSamplesDelta(prev, sample, nil)?.takeRetainedValue(),
+              let dict = delta as? [String: Any],
+              let channelsList = dict["IOReportChannels"] as? NSArray else { return nil }
+        
+        var watts: Double = 0
+        let items = channelsList as CFArray
+        for i in 0..<CFArrayGetCount(items) {
+            let item = unsafeBitCast(CFArrayGetValueAtIndex(items, i), to: CFDictionary.self)
+            guard let channel = IOReportChannelGetChannelName(item)?.takeUnretainedValue() as? String,
+                  Self.isPMPCPUCluster(channel) else { continue }
+            watts += Self.histogramWatts(item)
+        }
+        return watts
+    }
+    
+    // "PACC" (M5 Max), "PACC0", "MACC3", "PACC1 SRAM" (M5 Ultra); not "AGX" (GPU).
+    private static func isPMPCPUCluster(_ channel: String) -> Bool {
+        let name = channel.hasSuffix(" SRAM") ? String(channel.dropLast(5)) : channel
+        guard name.count >= 4, name.dropFirst().hasPrefix("ACC") else { return false }
+        return name.dropFirst(4).allSatisfy(\.isNumber)
+    }
+    
+    // Residency-weighted average of the watt bins ("2W", "0.250W"). Each bin
+    // reads at its label: on an M5 Ultra the GPU "AGX" histogram read this way
+    // averaged 62.2 W against 63.5 W from "GPU Energy" over the same 8 s. The
+    // lowest bin reads as 0, since an idle cluster sits there all the time.
+    private static func histogramWatts(_ item: CFDictionary) -> Double {
+        let count = IOReportStateGetCount(item)
+        var total: Int64 = 0
+        var weighted: Double = 0
+        for i in 0..<count {
+            let residency = IOReportStateGetResidency(item, i)
+            total += residency
+            guard i > 0, residency > 0,
+                  let name = IOReportStateGetNameForIndex(item, i)?.takeUnretainedValue() as String?,
+                  let bin = Double(name.trimmingCharacters(in: .whitespaces).dropLast()) else { continue } // "   2W" -> 2
+            weighted += bin * Double(residency)
+        }
+        return total > 0 ? weighted / Double(total) : 0
     }
 }

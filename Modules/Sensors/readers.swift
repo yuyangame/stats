@@ -34,6 +34,11 @@ internal class SensorsReader: Reader<Sensors_List> {
     private var pmpSubscription: IOReportSubscriptionRef? = nil
     private var pmpPrevSample: CFDictionary? = nil
     private var energyModelCPUGated: Bool = false
+    private var energyModelRAMGated: Bool = false
+    // DRAM power, one SMC key per die ("PZD1", "PZD2"). On an M5 Max, PZD1
+    // went from 1.8 W to 14 W with memory-streaming threads and stayed at
+    // 1.8 W under compute-only load.
+    private lazy var dramPowerKeys: [String] = (1...8).map({ "PZD\($0)" }).prefix(while: { SMC.shared.getValue($0) != nil }).map({ $0 })
     
     init(callback: @escaping (T?) -> Void = {_ in }) {
         self.unknownSensorsState = Store.shared.bool(key: "Sensors_unknown", defaultValue: false)
@@ -635,11 +640,19 @@ extension SensorsReader {
         if self.energyModelCPUGated, let pmpCPU {
             cpu = pmpCPU
         }
+        var ram = Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed)
+        let smcRAM = self.dramPowerKeys.reduce(0) { $0 + (SMC.shared.getValue($1) ?? 0) }
+        if ram <= 0, smcRAM > 0 {
+            self.energyModelRAMGated = true
+        }
+        if self.energyModelRAMGated {
+            ram = smcRAM
+        }
         return (
             cpu,
             Self.appleSiliconPower(currentEnergy: self.powers.GPU, previousEnergy: prevGPU, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.ANE, previousEnergy: prevANE, elapsed: elapsed),
-            Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed),
+            ram,
             Self.appleSiliconPower(currentEnergy: self.powers.PCI, previousEnergy: prevPCI, elapsed: elapsed)
         )
     }
